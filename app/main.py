@@ -15,14 +15,19 @@ from typing import Optional
 from fastapi import Depends, FastAPI, File, Form, Query, Request, UploadFile
 from fastapi.responses import JSONResponse
 
-from . import catalog, ingest, query
+from . import calibration, catalog, ingest, query
 from .config import FIXED_COLUMNS, MAX_INDICATORS
 from .db import connect, immediate_transaction, init_db
 from .models import (
+    CalibrationListOut,
+    CalibrationOut,
+    CalibrationReplaceRequest,
     CreateIndicatorRequest,
     IndicatorChangeResponse,
     IndicatorOut,
     NotFound,
+    QualifiedPage,
+    QualifiedSnapshotMeta,
     RenameRequest,
     RowPage,
     SchemaOut,
@@ -229,11 +234,118 @@ def get_rows(
     summary="查看快照固化的字段与分片",
 )
 def get_snapshot(snapshot_id: int, conn=Depends(get_conn)):
-    meta = query.get_snapshot_meta(conn, snapshot_id)
+    meta = query.get_snapshot_meta(conn, snapshot_id, expected_kind="rows")
     return SnapshotMeta(
         snapshot_id=meta["snapshot_id"],
         created_at=meta["created_at"],
         indicator_names=meta["indicator_names"],
+        shard_ids=meta["shard_ids"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# 校准区间（站点 × 指标 ID）
+# ---------------------------------------------------------------------------
+
+@app.get(
+    "/calibrations",
+    response_model=CalibrationListOut,
+    tags=["校准期"],
+    summary="列出校准状态（可按站点过滤）",
+)
+def list_calibrations(station: Optional[str] = Query(None), conn=Depends(get_conn)):
+    return CalibrationListOut(
+        station=station, items=calibration.list_calibrations(conn, station)
+    )
+
+
+@app.get(
+    "/calibrations/{station:path}/{indicator_id}",
+    response_model=CalibrationOut,
+    tags=["校准期"],
+    summary="读取某站点 × 指标 ID 的当前校准区间",
+)
+def get_calibration(station: str, indicator_id: int, conn=Depends(get_conn)):
+    return calibration.get_calibration(conn, station, indicator_id)
+
+
+@app.put(
+    "/calibrations/{station:path}/{indicator_id}",
+    response_model=CalibrationOut,
+    tags=["校准期"],
+    summary="整体替换某站点 × 指标 ID 的全部校准区间（须带所见修订号）",
+)
+def replace_calibration(
+    station: str,
+    indicator_id: int,
+    payload: CalibrationReplaceRequest,
+    request: Request,
+    conn=Depends(get_conn),
+    lock=Depends(get_lock),
+):
+    with lock, immediate_transaction(conn):
+        result = calibration.replace_calibration(
+            conn,
+            station,
+            indicator_id,
+            payload.expected_revision,
+            [i.model_dump() for i in payload.intervals],
+        )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 合格数据查询（校准期内的原值）
+# ---------------------------------------------------------------------------
+
+@app.get(
+    "/qualified-rows",
+    response_model=QualifiedPage,
+    tags=["查询"],
+    summary="按站点 × 指标 ID 分页查询合格数据（首次不带 snapshot_id 即固化快照）",
+)
+def get_qualified_rows(
+    request: Request,
+    station: Optional[str] = Query(None, description="站点；首次查询必填，翻页时可省略"),
+    indicator_id: Optional[int] = Query(None, description="指标身份 ID；首次查询必填，翻页时可省略"),
+    snapshot_id: Optional[int] = Query(None, description="快照号；首次查询留空，服务端创建并返回"),
+    include_outside: Optional[bool] = Query(
+        None, description="是否附带校准期外的值用于审计对照（默认 false；翻页须与首次一致）"
+    ),
+    page: int = Query(1, ge=1, description="页码，从 1 开始"),
+    page_size: int = Query(100, ge=1, le=10000, description="每页行数，1~10000"),
+    conn=Depends(get_conn),
+    lock=Depends(get_lock),
+):
+    # 快照创建、校准替换、上传共用同一把写锁 + 立即事务：
+    # 首次查询看到的是一个完整已提交状态，不会与并发的校准更正交错。
+    with lock, immediate_transaction(conn):
+        result = query.query_qualified_page(
+            conn, snapshot_id, station, indicator_id, page, page_size, include_outside
+        )
+    return result
+
+
+@app.get(
+    "/qualified-snapshots/{snapshot_id}",
+    response_model=QualifiedSnapshotMeta,
+    tags=["查询"],
+    summary="查看合格数据查询快照固化的指标身份与校准区间",
+)
+def get_qualified_snapshot(snapshot_id: int, conn=Depends(get_conn)):
+    meta = query.get_snapshot_meta(conn, snapshot_id, expected_kind="qualified")
+    return QualifiedSnapshotMeta(
+        snapshot_id=meta["snapshot_id"],
+        created_at=meta["created_at"],
+        station=meta["station"],
+        indicator_id=meta["indicator_id"],
+        indicator_name=meta["indicator_name"],
+        calibration_revision=meta["calibration_revision"],
+        calibration_intervals=meta["calibration_intervals"],
+        calibration_status=(
+            "configured" if meta["calibration_intervals"] else "missing"
+        ),
+        include_outside_calibration=meta["include_outside"],
         shard_ids=meta["shard_ids"],
     )
 

@@ -63,9 +63,49 @@ CREATE TABLE IF NOT EXISTS shard_indicators (
 );
 
 -- 查询快照：首次查询固化字段集合与分片集合
+-- kind='rows'      -> 原始数据查询（/rows）
+-- kind='qualified' -> 校准合格数据查询（/qualified-rows），station 记录查询站点
 CREATE TABLE IF NOT EXISTS snapshots (
     snapshot_id  INTEGER PRIMARY KEY AUTOINCREMENT,
-    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    kind         TEXT NOT NULL DEFAULT 'rows' CHECK (kind IN ('rows', 'qualified')),
+    station      TEXT,
+    indicator_id INTEGER,
+    calibration_revision INTEGER,
+    include_outside INTEGER NOT NULL DEFAULT 0 CHECK (include_outside IN (0, 1))
+);
+
+-- 校准区间：按 (station, indicator_id) 的修订号保存；历史修订不删除
+CREATE TABLE IF NOT EXISTS calibration_sets (
+    station       TEXT NOT NULL,
+    indicator_id  INTEGER NOT NULL REFERENCES indicators(indicator_id),
+    revision      INTEGER NOT NULL CHECK (revision >= 1),
+    updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (station, indicator_id)
+);
+
+CREATE TABLE IF NOT EXISTS calibration_intervals (
+    station       TEXT NOT NULL,
+    indicator_id  INTEGER NOT NULL,
+    revision      INTEGER NOT NULL,
+    position      INTEGER NOT NULL,
+    valid_from_us INTEGER NOT NULL,
+    valid_to_us   INTEGER NOT NULL,
+    PRIMARY KEY (station, indicator_id, revision, position),
+    CHECK (valid_from_us < valid_to_us),
+    FOREIGN KEY (station, indicator_id)
+        REFERENCES calibration_sets(station, indicator_id) ON DELETE CASCADE
+);
+
+-- 合格数据查询快照固化的校准区间（与 head 解耦，后续更正不影响旧查询）
+CREATE TABLE IF NOT EXISTS snapshot_calibrations (
+    snapshot_id   INTEGER NOT NULL REFERENCES snapshots(snapshot_id),
+    indicator_id  INTEGER NOT NULL REFERENCES indicators(indicator_id),
+    revision      INTEGER NOT NULL,
+    position      INTEGER NOT NULL,
+    valid_from_us INTEGER NOT NULL,
+    valid_to_us   INTEGER NOT NULL,
+    PRIMARY KEY (snapshot_id, position)
 );
 
 CREATE TABLE IF NOT EXISTS snapshot_fields (
@@ -122,6 +162,28 @@ def immediate_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connecti
         conn.commit()
 
 
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    if column not in _table_columns(conn, table):
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """就地升级旧库：为旧版 ``snapshots`` 补齐新列。
+
+    ``CREATE TABLE IF NOT EXISTS`` 不会修改已存在的表，因此从旧版本升级时
+    必须显式补列。旧快照一律视为原始数据快照（kind='rows'）。
+    """
+    _ensure_column(conn, "snapshots", "kind", "TEXT NOT NULL DEFAULT 'rows'")
+    _ensure_column(conn, "snapshots", "station", "TEXT")
+    _ensure_column(conn, "snapshots", "indicator_id", "INTEGER")
+    _ensure_column(conn, "snapshots", "calibration_revision", "INTEGER")
+    _ensure_column(conn, "snapshots", "include_outside", "INTEGER NOT NULL DEFAULT 0")
+
+
 def init_db() -> None:
     """初始化目录与表结构，并写入空的字段版 1。"""
     SHARD_DIR.mkdir(parents=True, exist_ok=True)
@@ -132,12 +194,13 @@ def init_db() -> None:
     conn = connect()
     try:
         conn.executescript(SCHEMA_SQL)
+        _migrate_schema(conn)
         row = conn.execute("SELECT COUNT(*) AS n FROM schema_versions").fetchone()
         if row["n"] == 0:
             conn.execute(
                 "INSERT INTO schema_versions (version_id, change_note) VALUES (1, ?)",
                 ("初始化空字段版",),
             )
-            conn.commit()
+        conn.commit()
     finally:
         conn.close()

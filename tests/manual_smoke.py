@@ -96,6 +96,98 @@ def main() -> int:
     assert rejected.status_code == 409, rejected.text
     print("deleted-indicator upload rejected:", rejected.json()["detail"])
 
+    # ------------------------------------------------------------------
+    # 校准区间 + 合格数据查询
+    # ------------------------------------------------------------------
+    ind = c.post("/schema/indicators", json={"name": "校准指标"}).json()
+    ind_id, v = ind["indicator_id"], ind["new_version"]
+    c.post(
+        "/ingest/parquet",
+        data={"schema_version": str(v)},
+        files={"file": ("cal.parquet", parquet_bytes({
+            "station": ["Z1", "Z1", "Z1", "Z2"],
+            "sampled_at": [
+                "2026-02-01T00:00:00Z",   # 校准期前 -> 隔离
+                "2026-03-01T00:00:00Z",   # 期内 -> 原值
+                "2026-03-15T00:00:00Z",   # 期内但 NULL -> calibrated_null
+                "2026-03-01T00:00:00Z",   # 别的站点
+            ],
+            "校准指标": [99.0, 5.5, None, 7.5],
+        }, {"sampled_at": pa.string()}), "application/vnd.apache.parquet")},
+    ).raise_for_status()
+
+    cal = c.get(f"/calibrations/Z1/{ind_id}").json()
+    assert cal["revision"] == 0 and cal["intervals"] == []
+    r = c.put(
+        f"/calibrations/Z1/{ind_id}",
+        json={"expected_revision": 0, "intervals": [
+            {"valid_from": "2026-03-01T00:00:00Z", "valid_to": "2026-04-01T00:00:00Z"},
+        ]},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["revision"] == 1
+
+    # 过期修订号 -> 409 且状态不变
+    stale = c.put(
+        f"/calibrations/Z1/{ind_id}",
+        json={"expected_revision": 0, "intervals": []},
+    )
+    assert stale.status_code == 409
+    assert c.get(f"/calibrations/Z1/{ind_id}").json()["revision"] == 1
+
+    q = c.get("/qualified-rows", params={"station": "Z1", "indicator_id": ind_id}).json()
+    snap_q = q["snapshot_id"]
+    print("qualified:", q["calibration_status"], q["calibration_revision"], "rows:", q["total_rows"])
+    assert q["calibration_status"] == "configured"
+    assert q["calibration_revision"] == 1
+    assert q["total_rows"] == 2
+    statuses = {row["sampled_at"]: row["status"] for row in q["rows"]}
+    assert statuses == {
+        "2026-03-01T00:00:00.000000Z": "calibrated",
+        "2026-03-15T00:00:00.000000Z": "calibrated_null",
+    }
+    assert {row["value"] for row in q["rows"]} == {5.5, None}
+
+    # 审计对照：期外值以 uncalibrated 出现
+    audit = c.get(
+        "/qualified-rows",
+        params={"station": "Z1", "indicator_id": ind_id, "include_outside": "true"},
+    ).json()
+    assert len(audit["rows"]) == 3
+    assert "uncalibrated" in {row["status"] for row in audit["rows"]}
+
+    # 原始 /rows 仍返回全部原值，包括校准期外
+    raw = c.get("/rows", params={"page_size": 100}).json()
+    raw_vals = {(row["station"], row["sampled_at"]): row["校准指标"] for row in raw["rows"]}
+    assert raw_vals[("Z1", "2026-02-01T00:00:00.000000Z")] == 99.0
+
+    # 更正校准 + 改名后：旧查询完全冻结，新查询取最新状态
+    c.put(
+        f"/calibrations/Z1/{ind_id}",
+        json={"expected_revision": 1, "intervals": [
+            {"valid_from": "2026-02-01T00:00:00Z", "valid_to": "2026-03-10T00:00:00Z"},
+        ]},
+    ).raise_for_status()
+    c.post(
+        "/schema/indicators/rename",
+        json={"old_name": "校准指标", "new_name": "校准指标改名"},
+    ).raise_for_status()
+
+    frozen_q = c.get("/qualified-rows", params={"snapshot_id": snap_q}).json()
+    assert frozen_q["indicator_name"] == "校准指标"
+    assert frozen_q["calibration_revision"] == 1
+    assert frozen_q["total_rows"] == 2
+
+    fresh_q = c.get("/qualified-rows", params={"station": "Z1", "indicator_id": ind_id}).json()
+    assert fresh_q["indicator_name"] == "校准指标改名"
+    assert fresh_q["calibration_revision"] == 2
+    # 新窗口 [02-01, 03-10) 含 02-01(99.0) 与 03-01(5.5)；03-15 的 NULL 已在期外
+    assert [row["value"] for row in fresh_q["rows"]] == [99.0, 5.5]
+    assert all(row["status"] == "calibrated" for row in fresh_q["rows"])
+
+    print("calibration edit/snapshot freeze verified; docs:",
+          c.get("/docs").status_code)
+
     print("\nSMOKE OK")
     return 0
 

@@ -41,6 +41,14 @@ def find_active_by_name(conn: sqlite3.Connection, name: str) -> Optional[sqlite3
     ).fetchone()
 
 
+def indicator_by_id(conn: sqlite3.Connection, indicator_id: int) -> Optional[sqlite3.Row]:
+    """按身份 ID 查指标（含已删除指标，active=0）。"""
+    return conn.execute(
+        "SELECT indicator_id, name, active FROM indicators WHERE indicator_id = ?",
+        (indicator_id,),
+    ).fetchone()
+
+
 def version_note(conn: sqlite3.Connection, version_id: int) -> Optional[str]:
     row = conn.execute(
         "SELECT change_note FROM schema_versions WHERE version_id = ?",

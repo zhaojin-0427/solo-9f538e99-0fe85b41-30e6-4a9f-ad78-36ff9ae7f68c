@@ -1,7 +1,7 @@
 """Pydantic 响应/请求模型与统一错误类型。"""
 from __future__ import annotations
 
-from typing import List
+from typing import List, Literal, Optional
 
 from fastapi import HTTPException
 from pydantic import BaseModel, Field
@@ -87,3 +87,101 @@ class RowPage(BaseModel):
     fixed_columns: List[str]
     indicator_names: List[str] = Field(..., description="快照固化的当前指标名；旧分片没有的指标为 null")
     rows: List[dict]
+
+
+# ---------------------------------------------------------------------------
+# 校准区间
+# ---------------------------------------------------------------------------
+
+class CalibrationInterval(BaseModel):
+    """UTC 半开区间 ``[valid_from, valid_to)``；首尾可相接，不可重叠。"""
+
+    valid_from: str = Field(..., description="区间起点（含），ISO-8601，UTC；如 2026-01-01T00:00:00Z")
+    valid_to: str = Field(..., description="区间终点（不含），ISO-8601，UTC；必须晚于起点")
+
+
+class CalibrationReplaceRequest(BaseModel):
+    """整体替换某站点×指标的全部校准区间。"""
+
+    expected_revision: int = Field(
+        ...,
+        ge=0,
+        description="提交方所见修订号（从未设置过为 0）；与当前不一致即 409，且不改变状态",
+    )
+    intervals: List[CalibrationInterval] = Field(
+        default_factory=list,
+        description="完整区间列表；空列表表示清除该校准，仍会推进修订号",
+    )
+
+
+class CalibrationOut(BaseModel):
+    station: str
+    indicator_id: int
+    indicator_name: str = Field(..., description="指标当前名（仅供展示，身份以 indicator_id 为准）")
+    indicator_active: bool
+    revision: int = Field(..., description="当前修订号；从未设置时为 0")
+    updated_at: Optional[str] = None
+    intervals: List[CalibrationInterval]
+
+
+class CalibrationListOut(BaseModel):
+    station: Optional[str] = None
+    items: List[CalibrationOut]
+
+
+# ---------------------------------------------------------------------------
+# 合格数据查询
+# ---------------------------------------------------------------------------
+
+QualifiedStatus = Literal["calibrated", "calibrated_null", "uncalibrated"]
+
+
+class QualifiedRow(BaseModel):
+    station: str
+    sampled_at: str
+    value: Optional[float] = Field(
+        None, description="原值；未测为 null。注意用 status 区分“原值 NULL”与“缺少有效校准”"
+    )
+    status: QualifiedStatus = Field(
+        ...,
+        description=(
+            "calibrated=有效期内且有值；calibrated_null=有效期内但原值为 NULL；"
+            "uncalibrated=校准期外（默认不返回，仅审计对照时出现）"
+        ),
+    )
+    in_calibration_window: bool
+    value_present: bool = Field(..., description="原值是否为非 NULL（等价于 value is not null）")
+
+
+class QualifiedPage(BaseModel):
+    snapshot_id: int
+    snapshot_created: bool
+    kind: Literal["qualified"] = "qualified"
+    station: str
+    indicator_id: int
+    indicator_name: str
+    calibration_revision: int
+    calibration_intervals: List[CalibrationInterval]
+    calibration_status: Literal["configured", "missing"] = Field(
+        ..., description="missing 表示该站点×指标在查询时没有任何有效校准区间"
+    )
+    include_outside_calibration: bool
+    page: int
+    page_size: int
+    total_rows: int
+    total_pages: int
+    rows: List[QualifiedRow]
+
+
+class QualifiedSnapshotMeta(BaseModel):
+    snapshot_id: int
+    created_at: str
+    kind: Literal["qualified"] = "qualified"
+    station: str
+    indicator_id: int
+    indicator_name: str
+    calibration_revision: int
+    calibration_intervals: List[CalibrationInterval]
+    calibration_status: Literal["configured", "missing"]
+    include_outside_calibration: bool
+    shard_ids: List[int]
